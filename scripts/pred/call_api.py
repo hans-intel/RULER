@@ -37,12 +37,19 @@ import os
 import sys
 import threading
 import importlib
-import math
 import time
 from tqdm import tqdm
 from pathlib import Path
-import traceback
-from nemo.collections.asr.parts.utils.manifest_utils import read_manifest
+import re
+
+try:
+    from data.manifest_utils import read_manifest
+except ModuleNotFoundError:
+    curr_folder = Path(__file__).resolve().parent
+    scripts_root = curr_folder.parent
+    if str(scripts_root) not in sys.path:
+        sys.path.append(str(scripts_root))
+    from data.manifest_utils import read_manifest
 
 SERVER_TYPES = (
     'trtllm',
@@ -69,11 +76,25 @@ parser.add_argument("--task", type=str, required=True, help='Options: tasks in b
 parser.add_argument("--subset", type=str, default='validation', help='Options: validation or test')
 parser.add_argument("--chunk_idx", type=int, default=0, help='index of current split chunk')
 parser.add_argument("--chunk_amount", type=int, default=1, help='size of split chunk')
+parser.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=False,
+                    help='Overwrite existing prediction file instead of resuming from existing rows.')
 
 # Server
 parser.add_argument("--server_type", default='nemo', action=ServerAction, choices=SERVER_TYPES)
 parser.add_argument("--server_host", type=str, default='127.0.0.1')
 parser.add_argument("--server_port", type=str, default='5000')
+parser.add_argument("--vllm_endpoint", type=str, default='native', choices=['native', 'completions', 'chat'],
+                    help='vLLM endpoint mode: native=/generate, completions=/v1/completions, chat=/v1/chat/completions')
+parser.add_argument("--api_base_url", type=str, default='',
+                    help='Base URL for OpenAI-compatible API. Example: http://127.0.0.1:8000/v1')
+parser.add_argument("--api_key_env", type=str, default='VLLM_API_KEY',
+                    help='Environment variable that stores API key for OpenAI-compatible endpoint')
+parser.add_argument("--disable_auth_header", action=argparse.BooleanOptionalAction, default=True,
+                    help='Disable Authorization header for OpenAI-compatible endpoints (default: true).')
+parser.add_argument("--proxy_url", type=str, default='',
+                    help='Optional HTTP/HTTPS proxy URL for API requests, e.g. http://proxy.mycorp:8080')
+parser.add_argument("--truncate_prompt_tokens", type=int, default=0,
+                    help='For OpenAI-compatible vLLM endpoints: keep at most this many prompt tokens (0 disables).')
 parser.add_argument("--ssh_server", type=str)
 parser.add_argument("--ssh_key_path", type=str)
 parser.add_argument("--model_name_or_path", type=str, default='gpt-3.5-turbo', 
@@ -88,6 +109,8 @@ parser.add_argument("--stop_words", type=str, default='')
 parser.add_argument("--sliding_window_size", type=int)
 parser.add_argument("--threads", type=int, default=4)
 parser.add_argument("--batch_size", type=int, default=1)
+parser.add_argument("--request_max_retries", type=int, default=3,
+                    help='Max retries per batch request before writing empty predictions for that batch.')
 
 args = parser.parse_args()
 args.stop_words = list(filter(None, args.stop_words.split(',')))
@@ -101,6 +124,7 @@ def get_llm(tokens_to_generate):
         llm = TRTLLMClient(
             server_host=args.server_host,
             server_port=args.server_port,
+            proxy_url=args.proxy_url if args.proxy_url else None,
             ssh_server=args.ssh_server,
             ssh_key_path=args.ssh_key_path,
             temperature=args.temperature,
@@ -117,6 +141,13 @@ def get_llm(tokens_to_generate):
         llm = VLLMClient(
             server_host=args.server_host,
             server_port=args.server_port,
+            proxy_url=args.proxy_url if args.proxy_url else None,
+            model_name=args.model_name_or_path,
+            vllm_endpoint=args.vllm_endpoint,
+            api_base_url=args.api_base_url if args.api_base_url else None,
+            api_key=os.getenv(args.api_key_env, 'EMPTY'),
+            disable_auth_header=args.disable_auth_header,
+            truncate_prompt_tokens=args.truncate_prompt_tokens,
             ssh_server=args.ssh_server,
             ssh_key_path=args.ssh_key_path,
             temperature=args.temperature,
@@ -132,6 +163,7 @@ def get_llm(tokens_to_generate):
         llm = SGLClient(
             server_host=args.server_host,
             server_port=args.server_port,
+            proxy_url=args.proxy_url if args.proxy_url else None,
             ssh_server=args.ssh_server,
             ssh_key_path=args.ssh_key_path,
             temperature=args.temperature,
@@ -231,35 +263,139 @@ def main():
     pred_file.parent.mkdir(parents=True, exist_ok=True)
 
     # Load data
-    if os.path.exists(pred_file):
-        pred_index = [sample['index'] for sample in read_manifest(pred_file)]
-        data = [sample for sample in read_manifest(task_file) if sample['index'] not in pred_index]
+    all_data = read_manifest(task_file)
+    if os.path.exists(pred_file) and args.overwrite:
+        os.remove(pred_file)
+        data = all_data
+    elif os.path.exists(pred_file):
+        pred_index = {sample['index'] for sample in read_manifest(pred_file)}
+        data = [sample for sample in all_data if sample['index'] not in pred_index]
     else:
-        data = read_manifest(task_file)
+        data = all_data
+
+    if len(data) == 0:
+        print('No remaining samples to process.')
+        return
 
     # Load api
     llm = get_llm(config['tokens_to_generate'])
+    realtime_request_progress = args.server_type == 'vllm' and args.vllm_endpoint in ('completions', 'chat')
 
     def get_output(idx_list, index_list, input_list, outputs_list, others_list, truncation_list, length_list):
         nonlocal llm
 
-        while True:
+        def sanitize_prompt(prompt):
+            if prompt is None:
+                return ''
+            if not isinstance(prompt, str):
+                prompt = str(prompt)
+            return re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', prompt)
+
+        def compact_error(exc, max_chars=400):
+            msg = str(exc).replace('\n', ' ')
+            if len(msg) > max_chars:
+                return msg[:max_chars] + ' ... [truncated]'
+            return msg
+
+        def on_request_done(step=1):
+            if not realtime_request_progress:
+                return
+            with progress_lock:
+                progress.update(step)
+                progress.refresh()
+
+        def normalize_pred_text(pred):
+            if pred is None:
+                return ''
+
+            if isinstance(pred, str):
+                return pred
+
+            if isinstance(pred, dict):
+                pred_text = pred.get('text', '')
+            else:
+                pred_text = getattr(pred, 'text', '')
+
+            if pred_text is None:
+                return ''
+            if isinstance(pred_text, str):
+                return pred_text
+            if isinstance(pred_text, list):
+                if len(pred_text) == 0:
+                    return ''
+                first_item = pred_text[0]
+                return '' if first_item is None else str(first_item)
+            return str(pred_text)
+
+        sanitized_input_list = [sanitize_prompt(prompt) for prompt in input_list]
+
+        pred_list = None
+        last_exception = None
+        for attempt in range(1, args.request_max_retries + 1):
             try:
-                pred_list = llm.process_batch(prompts=input_list)
+                pred_list = llm.process_batch(prompts=sanitized_input_list, on_result=on_request_done)
                 break
             except Exception as e:
-                traceback.print_exc()
+                last_exception = e
+                print(
+                    f"[WARN] Batch request failed (attempt {attempt}/{args.request_max_retries}): "
+                    f"{compact_error(e)}"
+                )
+                time.sleep(min(attempt, 5))
 
-        zipped_iter = zip(pred_list, idx_list, index_list, input_list,
-                          outputs_list, others_list, truncation_list, length_list)
+        if pred_list is None:
+            if last_exception is not None:
+                print(f"[ERROR] Batch failed after retries: {compact_error(last_exception)}")
+            print("[INFO] Falling back to per-sample retries for this failed batch.")
+            pred_list = []
+            for single_prompt in sanitized_input_list:
+                single_pred = None
+                for attempt in range(1, args.request_max_retries + 1):
+                    try:
+                        single_ret = llm.process_batch(prompts=[single_prompt])
+                        if isinstance(single_ret, list) and len(single_ret) > 0:
+                            single_pred = single_ret[0]
+                        else:
+                            single_pred = single_ret
+                        break
+                    except Exception as e:
+                        if attempt == args.request_max_retries:
+                            print(
+                                f"[WARN] Single-sample fallback failed after {args.request_max_retries} retries: "
+                                f"{compact_error(e)}"
+                            )
+                        time.sleep(min(attempt, 3))
+                if single_pred is None:
+                    single_pred = {'text': ''}
+                pred_list.append(single_pred)
+                on_request_done(1)
+
+        if not isinstance(pred_list, list):
+            pred_list = [pred_list]
+
+        if len(pred_list) != len(input_list):
+            print(
+                f"[WARN] Prediction count mismatch for batch: got {len(pred_list)} predictions "
+                f"for {len(input_list)} inputs. Missing entries will be filled with empty predictions."
+            )
+            if len(pred_list) < len(input_list):
+                pred_list = pred_list + ([{'text': ''}] * (len(input_list) - len(pred_list)))
+            else:
+                pred_list = pred_list[:len(input_list)]
+
+        zipped_iter = zip(
+            pred_list,
+            idx_list,
+            index_list,
+            input_list,
+            outputs_list,
+            others_list,
+            truncation_list,
+            length_list,
+        )
 
         for pred, idx, index, input, outputs, others, truncation, length in zipped_iter:
-            if isinstance(pred['text'], str):
-                pred_text = pred['text']
-            elif len(pred['text']) > 0:
-                pred_text = pred['text'][0]
-            else:
-                pred_text = ''
+            pred_text = normalize_pred_text(pred)
 
             outputs_parallel[idx] = {
                 'index': index,
@@ -273,6 +409,7 @@ def main():
 
     threads = []
     outputs_parallel = [{} for _ in range(len(data))]
+    progress_lock = threading.Lock()
 
     batched_data = []
     batch = []
@@ -293,7 +430,8 @@ def main():
         # the data is processed sequentially, so we can store the start and end of current processing window
         start_idx = 0  # window: [start_idx, end_idx]
 
-        for batch_idx, batch in tqdm(enumerate(batched_data), total=len(batched_data)):
+        progress = tqdm(total=len(data), desc=args.task, unit='sample')
+        for batch_idx, batch in enumerate(batched_data):
             idx_list = [data_point['idx'] for data_point in batch]
             end_idx = idx_list[-1]  # the data in a batch is ordered
 
@@ -302,8 +440,11 @@ def main():
                 kwargs=dict(
                     idx_list=idx_list,
                     index_list=[data_point['index'] for data_point in batch],
-                    input_list=[data_point['input'] for data_point in batch],
-                    outputs_list=[data_point['outputs'] for data_point in batch],
+                    input_list=[data_point.get('input', data_point.get('question', '')) for data_point in batch],
+                    outputs_list=[
+                        data_point.get('outputs', data_point.get('expected_answer', [data_point.get('output', '')]))
+                        for data_point in batch
+                    ],
                     others_list=[data_point.get('others', {}) for data_point in batch],
                     truncation_list=[data_point.get('truncation', -1) for data_point in batch],
                     length_list=[data_point.get('length', -1) for data_point in batch],
@@ -315,16 +456,33 @@ def main():
             is_last_batch = (batch_idx == len(batched_data) - 1)
 
             if (len(threads) == args.threads) or is_last_batch:
+                wait_start = time.time()
+                while True:
+                    alive_threads = [thread for thread in threads if thread.is_alive()]
+                    if len(alive_threads) == 0:
+                        break
+                    elapsed = int(time.time() - wait_start)
+                    progress.set_postfix_str(
+                        f"inflight_batches={len(alive_threads)} elapsed={elapsed}s"
+                    )
+                    progress.refresh()
+                    time.sleep(0.5)
+
                 for thread in threads:
                     thread.join()
                 threads = []
+                progress.set_postfix_str("")
 
                 # dump the results in current processing window on disk
                 for idx in range(start_idx, end_idx + 1):
                     if len(outputs_parallel[idx]) > 0:
                         fout.write(json.dumps(outputs_parallel[idx]) + '\n')
 
+                if not realtime_request_progress:
+                    progress.update(end_idx - start_idx + 1)
                 start_idx = end_idx + 1
+
+        progress.close()
 
     print(f"Used time: {round((time.time() - start_time) / 60, 1)} minutes")
 

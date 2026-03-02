@@ -15,6 +15,26 @@
 import json
 
 
+def read_manifest(manifest_path):
+    """
+    Read a jsonl manifest file.
+
+    Args:
+        manifest_path (str or Path): Path to input manifest file
+
+    Returns:
+        list[dict]: Parsed json objects from each non-empty line
+    """
+    entries = []
+    with open(manifest_path, "r", encoding="utf-8") as infile:
+        for line in infile:
+            line = line.strip()
+            if not line:
+                continue
+            entries.append(json.loads(line))
+    return entries
+
+
 def write_manifest(output_path, target_manifest, ensure_ascii: bool = True):
     """
     Write to manifest file

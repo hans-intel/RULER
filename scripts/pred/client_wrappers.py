@@ -24,7 +24,7 @@ import requests
 import traceback
 from pathlib import Path
 from typing import List, Tuple, Union
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
 from tenacity import (
     retry,
@@ -38,14 +38,22 @@ class Client(abc.ABC):
         self,
         server_host,
         server_port='5000',
+        proxy_url=None,
         ssh_server=None,
         ssh_key_path=None,
         **generation_kwargs
     ):
         self.server_host = server_host
         self.server_port = server_port
+        self.proxy_url = proxy_url
         self.ssh_server = os.getenv("SSH_SERVER", ssh_server)
         self.ssh_key_path = os.getenv("SSH_KEY_PATH", ssh_key_path)
+        self.proxies = None
+        if self.proxy_url:
+            self.proxies = {
+                "http": self.proxy_url,
+                "https": self.proxy_url,
+            }
         self.generation_kwargs = generation_kwargs
         
     @abc.abstractmethod
@@ -86,22 +94,28 @@ class Client(abc.ABC):
                 url="http://{}:{}/{}".format(self.server_host, self.server_port, route),
                 data=json.dumps(request),
                 headers={"Content-Type": "application/json"},
+                proxies=self.proxies,
             ).json()
         return outputs
 
-    def process_batch(self, prompts: List[str], **kwargs) -> List[dict]:
+    def process_batch(self, prompts: List[str], on_result=None, **kwargs) -> List[dict]:
         num_threads = max(96, multiprocessing.cpu_count() * 16)
         with ThreadPoolExecutor(num_threads) as executor:
-            futures = []
-            for prompt in prompts:
-                futures.append(
-                    executor.submit(
-                        self.__call__,
-                        prompt,
-                        **kwargs,
-                    )
+            futures = {}
+            for index, prompt in enumerate(prompts):
+                future = executor.submit(
+                    self.__call__,
+                    prompt,
+                    **kwargs,
                 )
-            rets = [f.result() for f in futures]
+                futures[future] = index
+
+            rets = [None] * len(prompts)
+            for future in as_completed(futures):
+                index = futures[future]
+                rets[index] = future.result()
+                if on_result is not None:
+                    on_result(1)
         return rets
 
 
@@ -134,6 +148,24 @@ class TRTLLMClient(Client):
 
 
 class VLLMClient(Client):
+    @staticmethod
+    def _extract_error_message(outputs):
+        if not isinstance(outputs, dict):
+            return str(outputs)
+        error_obj = outputs.get('error')
+        if isinstance(error_obj, dict):
+            return error_obj.get('message', str(error_obj))
+        if error_obj is not None:
+            return str(error_obj)
+        return str(outputs)
+
+    @staticmethod
+    def _build_headers(api_key, disable_auth_header):
+        headers = {"Content-Type": "application/json"}
+        if (not disable_auth_header) and api_key and str(api_key).strip() and str(api_key).strip().upper() != "EMPTY":
+            headers["Authorization"] = f"Bearer {str(api_key).strip()}"
+        return headers
+
     def _single_call(
         self,
         prompts,
@@ -143,7 +175,86 @@ class VLLMClient(Client):
         top_k,
         random_seed,
         stop: List[str],
+        model_name=None,
+        vllm_endpoint='native',
+        api_base_url=None,
+        api_key='EMPTY',
+        disable_auth_header=True,
+        truncate_prompt_tokens=0,
     ):
+        if vllm_endpoint in ('completions', 'chat'):
+            if api_base_url:
+                base_url = api_base_url.rstrip('/')
+            else:
+                base_url = f"http://{self.server_host}:{self.server_port}/v1"
+
+            if vllm_endpoint == 'chat':
+                url = f"{base_url}/chat/completions"
+                request = {
+                    "messages": [{"role": "user", "content": prompts[0]}],
+                    "max_tokens": tokens_to_generate,
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "stop": stop,
+                    "seed": random_seed,
+                }
+                if truncate_prompt_tokens and truncate_prompt_tokens > 0:
+                    request["truncate_prompt_tokens"] = truncate_prompt_tokens
+                if model_name:
+                    request["model"] = model_name
+
+                outputs = requests.post(
+                    url=url,
+                    data=json.dumps(request),
+                    headers=self._build_headers(api_key, disable_auth_header),
+                    proxies=self.proxies,
+                ).json()
+
+                if 'error' in outputs:
+                    msg = self._extract_error_message(outputs)
+                    if "max_tokens must be at least 1" in msg:
+                        raise RuntimeError(
+                            f"vLLM rejected request due to context overflow: {msg}. "
+                            "Try reducing data --max_seq_length, reducing output tokens, "
+                            "or set --truncate_prompt_tokens (e.g., 32768 or your server max context)."
+                        )
+                    raise RuntimeError(outputs['error'])
+
+                return outputs['choices'][0]['message']['content']
+
+            url = f"{base_url}/completions"
+            request = {
+                "prompt": prompts[0],
+                "max_tokens": tokens_to_generate,
+                "temperature": temperature,
+                "top_p": top_p,
+                "stop": stop,
+                "seed": random_seed,
+            }
+            if truncate_prompt_tokens and truncate_prompt_tokens > 0:
+                request["truncate_prompt_tokens"] = truncate_prompt_tokens
+            if model_name:
+                request["model"] = model_name
+
+            outputs = requests.post(
+                url=url,
+                data=json.dumps(request),
+                headers=self._build_headers(api_key, disable_auth_header),
+                proxies=self.proxies,
+            ).json()
+
+            if 'error' in outputs:
+                msg = self._extract_error_message(outputs)
+                if "max_tokens must be at least 1" in msg:
+                    raise RuntimeError(
+                        f"vLLM rejected request due to context overflow: {msg}. "
+                        "Try reducing data --max_seq_length, reducing output tokens, "
+                        "or set --truncate_prompt_tokens (e.g., 32768 or your server max context)."
+                    )
+                raise RuntimeError(outputs['error'])
+
+            return outputs['choices'][0]['text']
+
         request = {
             "prompt": prompts[0],
             "max_tokens": tokens_to_generate,

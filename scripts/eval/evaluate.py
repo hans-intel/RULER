@@ -26,19 +26,24 @@ python evaluate.py \
 import re
 import os
 import argparse
-import nltk
-try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt')
-    
+
 import pandas as pd
 import importlib
 import yaml
 from pathlib import Path
 from tqdm import tqdm
 from collections import defaultdict
-from nemo.collections.asr.parts.utils.manifest_utils import read_manifest, write_manifest
+
+try:
+    from data.manifest_utils import read_manifest, write_manifest
+except ModuleNotFoundError:
+    curr_folder = Path(__file__).resolve().parent
+    scripts_root = curr_folder.parent
+    import sys
+
+    if str(scripts_root) not in sys.path:
+        sys.path.append(str(scripts_root))
+    from data.manifest_utils import read_manifest, write_manifest
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--data_dir", type=str, required=True, help='path to the prediction jsonl files')
@@ -115,6 +120,9 @@ def run_evaluation_per_task(task_config: dict, predictions_file: str, verbose: i
 
 def write_evaluation(results: dict):
     tasks = list(results.keys())
+    if len(tasks) == 0:
+        print(f"No evaluation results found in {args.data_dir}. Skipping summary.csv generation.")
+        return
     score = [results[task]['score'] for task in tasks]
     nulls = [results[task]['nulls'] for task in tasks]
     dfs = [
@@ -132,6 +140,9 @@ def write_evaluation(results: dict):
 
 
 def write_submission(results: dict):
+    if len(results) == 0:
+        print(f"No submission rows found in {args.data_dir}. Skipping submission.csv generation.")
+        return
     COLUMNS = ["Task", "ID", "Prediction"]
     dfs = pd.DataFrame(columns=COLUMNS, data=[])
     
@@ -168,11 +179,24 @@ def aggregate_chunk(folder):
 
 def main():
     curr_folder = os.path.dirname(os.path.abspath(__file__))
-    
-    try:
-        module = importlib.import_module(f"{args.benchmark}.constants")
-    except ImportError:
-        print(f"Module eval.{args.benchmark}.constants not found.")
+
+    module = None
+    candidates = [
+        f"{args.benchmark}.constants",
+        f"eval.{args.benchmark}.constants",
+    ]
+    for module_name in candidates:
+        try:
+            module = importlib.import_module(module_name)
+            break
+        except ImportError:
+            continue
+
+    if module is None:
+        raise ImportError(
+            f"Unable to import benchmark constants module for '{args.benchmark}'. "
+            f"Tried: {candidates}"
+        )
 
     tasks_base = module.TASKS
     with open(os.path.join(curr_folder, f"../{args.benchmark}.yaml"), "r") as f:

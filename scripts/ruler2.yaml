@@ -1,0 +1,47 @@
+mk_niah_basic:
+  task: mk_niah_basic
+  args: {}
+
+mk_niah_easy:
+  task: mk_niah_easy
+  args: {}
+
+mk_niah_medium:
+  task: mk_niah_medium
+  args: {}
+
+mk_niah_hard:
+  task: mk_niah_hard
+  args: {}
+
+mv_niah_basic:
+  task: mv_niah_basic
+  args: {}
+
+mv_niah_easy:
+  task: mv_niah_easy
+  args: {}
+
+mv_niah_medium:
+  task: mv_niah_medium
+  args: {}
+
+mv_niah_hard:
+  task: mv_niah_hard
+  args: {}
+
+qa_basic:
+  task: qa_basic
+  args: {}
+
+qa_easy:
+  task: qa_easy
+  args: {}
+
+qa_medium:
+  task: qa_medium
+  args: {}
+
+qa_hard:
+  task: qa_hard
+  args: {}
