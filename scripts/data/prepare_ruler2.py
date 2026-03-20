@@ -2,6 +2,7 @@ import argparse
 import json
 import subprocess
 from pathlib import Path
+import gzip
 
 
 TASKS = [
@@ -83,10 +84,11 @@ def _module_cmd(task, output_folder, tokenizer_type, tokenizer_path, max_seq_len
     raise ValueError(f"Unsupported task: {task}")
 
 
-def _convert_to_ruler_schema(task_dir: Path, subset: str):
+def _convert_to_ruler_schema(task_dir: Path, subset: str, gzip_output: bool):
     src = task_dir / "test.jsonl"
-    dst = task_dir / f"{subset}.jsonl"
-    with open(src, "rt", encoding="utf-8") as fin, open(dst, "wt", encoding="utf-8") as fout:
+    dst = task_dir / f"{subset}.jsonl.gz" if gzip_output else task_dir / f"{subset}.jsonl"
+    writer = gzip.open if gzip_output else open
+    with open(src, "rt", encoding="utf-8") as fin, writer(dst, "wt", encoding="utf-8") as fout:
         for line in fin:
             sample = json.loads(line)
             converted = {
@@ -99,6 +101,15 @@ def _convert_to_ruler_schema(task_dir: Path, subset: str):
             fout.write(json.dumps(converted) + "\n")
 
 
+def _gzip_file_in_place(src: Path):
+    if not src.exists() or src.suffix == ".gz":
+        return
+    dst = src.with_suffix(src.suffix + ".gz")
+    with open(src, "rb") as fin, gzip.open(dst, "wb") as fout:
+        fout.writelines(fin)
+    src.unlink()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Prepare local RULER2 data in standalone RULER repo.")
     parser.add_argument("--save_dir", type=Path, required=True, help="Output dataset root directory")
@@ -108,6 +119,18 @@ def main():
     parser.add_argument("--tokenizer_type", type=str, default="hf", choices=["hf", "openai", "gemini"])
     parser.add_argument("--max_seq_length", type=int, required=True)
     parser.add_argument("--num_samples", type=int, default=100)
+    parser.add_argument(
+        "--gzip_output",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write prepared subset files as .jsonl.gz (default: true).",
+    )
+    parser.add_argument(
+        "--gzip_test_jsonl",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Gzip intermediate test.jsonl into test.jsonl.gz and remove test.jsonl (default: true).",
+    )
     parser.add_argument(
         "--skip_unfit_tasks",
         action=argparse.BooleanOptionalAction,
@@ -148,9 +171,12 @@ def main():
                 capture_output=True,
                 text=True,
             )
-            _convert_to_ruler_schema(task_dir, args.subset)
+            _convert_to_ruler_schema(task_dir, args.subset, args.gzip_output)
+            if args.gzip_test_jsonl:
+                _gzip_file_in_place(task_dir / "test.jsonl")
             prepared_tasks.append(task)
-            print(f"Prepared {task} -> {task_dir / (args.subset + '.jsonl')}")
+            prepared_name = f"{args.subset}.jsonl.gz" if args.gzip_output else f"{args.subset}.jsonl"
+            print(f"Prepared {task} -> {task_dir / prepared_name}")
         except subprocess.CalledProcessError as exc:
             stderr = exc.stderr or ""
             stdout = exc.stdout or ""

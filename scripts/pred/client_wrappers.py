@@ -80,6 +80,7 @@ class Client(abc.ABC):
         
     @retry(wait=wait_random_exponential(min=15, max=60), stop=stop_after_attempt(3))
     def _send_request(self, request, route="generate"):
+        timeout = self.generation_kwargs.get("request_timeout_seconds", 120)
         if self.ssh_server and self.ssh_key_path:
             import sshtunnel_requests
 
@@ -95,6 +96,7 @@ class Client(abc.ABC):
                 data=json.dumps(request),
                 headers={"Content-Type": "application/json"},
                 proxies=self.proxies,
+                timeout=timeout,
             ).json()
         return outputs
 
@@ -113,9 +115,20 @@ class Client(abc.ABC):
             rets = [None] * len(prompts)
             for future in as_completed(futures):
                 index = futures[future]
-                rets[index] = future.result()
-                if on_result is not None:
-                    on_result(1)
+                try:
+                    result = future.result()
+                    rets[index] = result
+                    if on_result is not None:
+                        on_result(index, True, result)
+                except Exception as e:
+                    failed_result = {
+                        '__failed__': True,
+                        'text': '',
+                        'error': str(e),
+                    }
+                    rets[index] = failed_result
+                    if on_result is not None:
+                        on_result(index, False, failed_result)
         return rets
 
 
@@ -166,6 +179,21 @@ class VLLMClient(Client):
             headers["Authorization"] = f"Bearer {str(api_key).strip()}"
         return headers
 
+    @staticmethod
+    def _parse_json_response(response, url):
+        try:
+            return response.json()
+        except ValueError as e:
+            body = response.text if response.text is not None else ""
+            body = re.sub(r'\s+', ' ', body).strip()
+            body_preview = body[:400] + (" ... [truncated]" if len(body) > 400 else "")
+            content_type = response.headers.get("Content-Type", "")
+            raise RuntimeError(
+                "Failed to parse JSON response from vLLM endpoint. "
+                f"status={response.status_code}, content_type='{content_type}', url='{url}', "
+                f"body_preview='{body_preview or '<empty>'}', decode_error='{e}'"
+            ) from e
+
     def _single_call(
         self,
         prompts,
@@ -180,9 +208,12 @@ class VLLMClient(Client):
         api_base_url=None,
         api_key='EMPTY',
         disable_auth_header=True,
+        reasoning_effort=None,
         truncate_prompt_tokens=0,
+        request_timeout_seconds=120,
     ):
         if vllm_endpoint in ('completions', 'chat'):
+            timeout = self.generation_kwargs.get("request_timeout_seconds", 120)
             if api_base_url:
                 base_url = api_base_url.rstrip('/')
             else:
@@ -202,13 +233,17 @@ class VLLMClient(Client):
                     request["truncate_prompt_tokens"] = truncate_prompt_tokens
                 if model_name:
                     request["model"] = model_name
+                if reasoning_effort:
+                    request["reasoning_effort"] = reasoning_effort
 
-                outputs = requests.post(
+                response = requests.post(
                     url=url,
                     data=json.dumps(request),
                     headers=self._build_headers(api_key, disable_auth_header),
                     proxies=self.proxies,
-                ).json()
+                    timeout=timeout,
+                )
+                outputs = self._parse_json_response(response, url)
 
                 if 'error' in outputs:
                     msg = self._extract_error_message(outputs)
@@ -235,13 +270,17 @@ class VLLMClient(Client):
                 request["truncate_prompt_tokens"] = truncate_prompt_tokens
             if model_name:
                 request["model"] = model_name
+            if reasoning_effort:
+                request["reasoning_effort"] = reasoning_effort
 
-            outputs = requests.post(
+            response = requests.post(
                 url=url,
                 data=json.dumps(request),
                 headers=self._build_headers(api_key, disable_auth_header),
                 proxies=self.proxies,
-            ).json()
+                timeout=timeout,
+            )
+            outputs = self._parse_json_response(response, url)
 
             if 'error' in outputs:
                 msg = self._extract_error_message(outputs)

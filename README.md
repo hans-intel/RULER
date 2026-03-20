@@ -47,13 +47,23 @@ mkdir -p "$DATA_DIR" "$PRED_DIR"
 You can also initialize these variables with:
 
 ```bash
-source ./scripts/init_env.sh <local_run_name> [max_seq_len] [num_samples] [batch_size] [tokenizer_path] [tokenizer_type]
+source ./scripts/init_env.sh --run_name <local_run_name> [options]
+
+# Example:
+source ./scripts/init_env.sh \
+  --run_name gpt-oss-120b-8k \
+  --max_seq_length 8192 \
+  --batch_size 64 \
+  --api_base_url http://127.0.0.1:8123/v1 \
+  --model_name_or_path /model/gpt-oss-120b-mxfp4
 ```
 
 Defaults from `scripts/init_env.sh`:
 - `max_seq_len=131072`
 - `num_samples=100`
-- `batch_size=1`
+- `batch_size=768`
+- `api_base_url=http://127.0.0.1:8123/v1`
+- `max_output_tokens=4096`
 - tokenizer auto-detected from `local_run_name` core model name when not provided.
 
 Auto-detection expects model-like names such as `gpt-oss-120b`, `qwen3-30b-a3b-instruct`, `llama-3.3-70b`.
@@ -142,6 +152,16 @@ python data/prepare_ruler2.py \
   --num_samples "$NUM_SAMPLES"
 ```
 
+By default, prepared files are now written as `.jsonl.gz`.
+Use `--no-gzip_output` if you need plain `.jsonl` files.
+
+To gzip existing plain `.jsonl` files under all run data folders:
+
+```bash
+cd "$RULER_ROOT"
+find local_runs -type f -path "*/data/*/*.jsonl" -print0 | xargs -0 -r gzip -f
+```
+
 Or run the helper wrapper:
 
 ```bash
@@ -153,8 +173,8 @@ For small context windows (e.g. 4k), some official RULER2 tasks may be infeasibl
 If you want strict/fail-fast behavior, pass `--no-skip_unfit_tasks` (or `--strict`).
 
 This creates task files like:
-- `$DATA_DIR/mk_niah_basic/validation.jsonl`
-- `$DATA_DIR/qa_hard/validation.jsonl`
+- `$DATA_DIR/mk_niah_basic/validation.jsonl.gz`
+- `$DATA_DIR/qa_hard/validation.jsonl.gz`
 
 ## 3) Run inference against external vLLM endpoint
 
@@ -179,7 +199,8 @@ for TASK in mk_niah_basic mk_niah_easy mk_niah_medium mk_niah_hard \
     --temperature 0.0 \
     --top_p 1.0 \
     --top_k 32 \
-    --batch_size "$BATCH_SIZE"
+    --batch_size "$BATCH_SIZE" \
+    --max_output_tokens 4096
  done
 ```
 
@@ -236,7 +257,8 @@ This reads `local_runs/<run_prefix>-<length>/pred/summary.csv` and reports:
 
 - If dataset download fails (`hotpotqa`, `mmlu`): retry with stable network and verify `datasets` install.
 - If endpoint rejects requests: verify `--api_base_url`, model name, and whether it expects chat or completions schema.
-- If generations are cut off: increase `tokens_to_generate` for that task in `scripts/data/ruler2/constants.py`.
+- If generations are cut off: increase `tokens_to_generate` for that task in `scripts/data/ruler2/constants.py` or raise `--max_output_tokens`.
+- If your vLLM server runs with a very large `max_model_len` (e.g., 128k), set `--max_output_tokens` (recommended start: `4096`) to prevent runaway/garbage generations from consuming long decode time.
 - If you see `max_tokens must be at least 1, got -N`: your prompt is too long for server context.
   - Lower `MAX_SEQ_LENGTH` in data preparation.
   - Or pass `--truncate_prompt_tokens <context_limit>` in `pred/call_api.py` (e.g. `32768`, `131072`, etc).

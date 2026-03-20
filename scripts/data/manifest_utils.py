@@ -13,6 +13,15 @@
 # limitations under the License
 
 import json
+import gzip
+from pathlib import Path
+
+
+def _open_manifest(path, mode):
+    manifest_path = Path(path)
+    if manifest_path.suffix == ".gz":
+        return gzip.open(manifest_path, mode, encoding="utf-8")
+    return open(manifest_path, mode, encoding="utf-8")
 
 
 def read_manifest(manifest_path):
@@ -26,7 +35,7 @@ def read_manifest(manifest_path):
         list[dict]: Parsed json objects from each non-empty line
     """
     entries = []
-    with open(manifest_path, "r", encoding="utf-8") as infile:
+    with _open_manifest(manifest_path, "rt") as infile:
         for line in infile:
             line = line.strip()
             if not line:
@@ -46,7 +55,7 @@ def write_manifest(output_path, target_manifest, ensure_ascii: bool = True):
                              non-ASCII characters escaped. If ensure_ascii is false, these characters
                              will be output as-is.
     """
-    with open(output_path, "w", encoding="utf-8") as outfile:
+    with _open_manifest(output_path, "wt") as outfile:
         for tgt in target_manifest:
             json.dump(tgt, outfile, ensure_ascii=ensure_ascii)
             outfile.write('\n')

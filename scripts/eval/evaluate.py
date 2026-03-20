@@ -161,11 +161,12 @@ def write_submission(results: dict):
 
 
 def aggregate_chunk(folder):
-    jsonl_files = [file for file in os.listdir(folder) if Path(file).suffix == '.jsonl' ]
-    chunk_files = sorted([file for file in jsonl_files if re.match(r'.*[^_]+-\d+\.jsonl', file)])
+    files = [file for file in os.listdir(folder) if file.endswith('.jsonl') or file.endswith('.jsonl.gz')]
+    chunk_files = sorted([file for file in files if re.match(r'.*[^_]+-\d+\.jsonl(\.gz)?$', file)])
     chunk_files_dict = defaultdict(list)
     for file in chunk_files:
-        task = '-'.join(file.split('-')[:-1])
+        name = file[:-8] if file.endswith('.jsonl.gz') else file[:-6]
+        task = '-'.join(name.split('-')[:-1])
         chunk_files_dict[task].append(file)
 
     for task, files in chunk_files_dict.items():
@@ -174,7 +175,7 @@ def aggregate_chunk(folder):
             file = os.path.join(folder, file)
             lines += read_manifest(file)
             os.remove(file) # Remove chunk files
-        write_manifest(os.path.join(folder, f'{task}.jsonl'), lines)
+        write_manifest(os.path.join(folder, f'{task}.jsonl.gz'), lines)
 
 
 def main():
@@ -213,20 +214,26 @@ def main():
     aggregate_chunk(args.data_dir)
 
     # Get scores and nulls
-    jsonl_files = [file for file in os.listdir(args.data_dir) if Path(file).suffix == '.jsonl']
+    prediction_files = [file for file in os.listdir(args.data_dir) if file.endswith('.jsonl') or file.endswith('.jsonl.gz')]
     eval_results = {}
     subm_results = {}
 
 
     for task, config in TASKS.items():
 
-        if f'{task}.jsonl' not in jsonl_files:
-            print(f'Prediction file {task}.jsonl is not found.')
+        task_file = None
+        if f'{task}.jsonl.gz' in prediction_files:
+            task_file = f'{task}.jsonl.gz'
+        elif f'{task}.jsonl' in prediction_files:
+            task_file = f'{task}.jsonl'
+
+        if task_file is None:
+            print(f'Prediction file {task}.jsonl(.gz) is not found.')
             continue
 
         print(f'Evaluate task {task}...')
         task_score, task_nulls, predicts, indices = run_evaluation_per_task(
-            predictions_file=os.path.join(args.data_dir, f'{task}.jsonl'),
+            predictions_file=os.path.join(args.data_dir, task_file),
             task_config=config,
         )
         eval_results[task] = {
