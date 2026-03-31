@@ -119,7 +119,7 @@ parser.add_argument("--max_output_tokens", type=int, default=0,
                     help='Optional hard cap for generation tokens per sample (0 means use task default).')
 parser.add_argument("--request_max_retries", type=int, default=1,
                     help='Max retries per batch request before writing empty predictions for that batch.')
-parser.add_argument("--request_timeout_seconds", type=float, default=600.0,
+parser.add_argument("--request_timeout_seconds", type=float, default=1200.0,
                     help='HTTP request timeout in seconds for API calls.')
 
 args = parser.parse_args()
@@ -286,11 +286,26 @@ def main():
     if pred_file_plain.exists():
         working_pred_file = pred_file_plain
     elif pred_file_gzip.exists():
-        with gzip.open(pred_file_gzip, 'rt', encoding='utf-8') as fin, open(pred_file_plain, 'wt', encoding='utf-8') as fout:
-            shutil.copyfileobj(fin, fout)
-        working_pred_file = pred_file_plain
+        # Validate gzip integrity before extracting. If corrupt, prefer existing plain file
+        try:
+            with gzip.open(pred_file_gzip, 'rb') as gzf:
+                gzf.read(1)
+            with gzip.open(pred_file_gzip, 'rt', encoding='utf-8') as fin, open(pred_file_plain, 'wt', encoding='utf-8') as fout:
+                shutil.copyfileobj(fin, fout)
+            working_pred_file = pred_file_plain
+        except (OSError, EOFError, gzip.BadGzipFile) as e:
+            print(f"[WARN] Detected corrupt gzip {pred_file_gzip}: {e}")
+            if pred_file_plain.exists():
+                print(f"[INFO] Using existing plain file {pred_file_plain} instead of corrupt gzip.")
+                working_pred_file = pred_file_plain
+            else:
+                try:
+                    pred_file_gzip.unlink()
+                except Exception as ex:
+                    print(f"[WARN] Failed to remove corrupt gzip {pred_file_gzip}: {ex}")
+                working_pred_file = pred_file_plain
     else:
-        working_pred_file = pred_file_plain if args.gzip_output else pred_file_plain
+        working_pred_file = pred_file_plain
 
     final_pred_file = pred_file_gzip if args.gzip_output else pred_file_plain
         
@@ -717,9 +732,34 @@ def main():
         writer_state['fout'] = None
 
     if args.gzip_output:
-        with open(pred_file_plain, 'rb') as fin, gzip.open(pred_file_gzip, 'wb') as fout:
-            shutil.copyfileobj(fin, fout)
-        pred_file_plain.unlink()
+        temp_gzip = pred_file_gzip.with_name(pred_file_gzip.name + '.part')
+        try:
+            with open(pred_file_plain, 'rb') as fin, gzip.open(temp_gzip, 'wb') as fout:
+                shutil.copyfileobj(fin, fout)
+            # validate temporary gzip
+            try:
+                with gzip.open(temp_gzip, 'rb') as gzf:
+                    gzf.read(1)
+                # atomic replace
+                os.replace(str(temp_gzip), str(pred_file_gzip))
+                try:
+                    pred_file_plain.unlink()
+                except Exception as ex:
+                    print(f"[WARN] Failed to remove plain file {pred_file_plain}: {ex}")
+            except (OSError, EOFError, gzip.BadGzipFile) as e:
+                print(f"[ERROR] Gzip validation failed for {temp_gzip}: {e}")
+                try:
+                    temp_gzip.unlink()
+                except Exception:
+                    pass
+                print(f"[INFO] Left plain file {pred_file_plain} in place for inspection.")
+        except Exception as e:
+            print(f"[ERROR] Failed to create gzip {pred_file_gzip}: {e}")
+            try:
+                if temp_gzip.exists():
+                    temp_gzip.unlink()
+            except Exception:
+                pass
 
     if failed_skipped > 0:
         print(f"[INFO] Skipped writing {failed_skipped} failed samples to {final_pred_file}. They will be retried on the next run.")

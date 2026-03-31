@@ -17,6 +17,23 @@ import gzip
 from pathlib import Path
 
 
+def is_valid_gzip(path):
+    """
+    Quick check whether a .gz file is a valid gzip archive by attempting
+    to read a small amount of data. Returns True if readable, False otherwise.
+    """
+    manifest_path = Path(path)
+    if not manifest_path.exists():
+        return False
+    try:
+        # open in binary and try to read one byte to validate file integrity
+        with gzip.open(manifest_path, 'rb') as f:
+            f.read(1)
+        return True
+    except (OSError, EOFError, gzip.BadGzipFile):
+        return False
+
+
 def _open_manifest(path, mode):
     manifest_path = Path(path)
     if manifest_path.suffix == ".gz":
